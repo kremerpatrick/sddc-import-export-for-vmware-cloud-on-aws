@@ -16,6 +16,7 @@ import re
 import time
 import sys
 import boto3
+import ipaddress
 
 from pathlib import Path
 from prettytable import PrettyTable
@@ -66,6 +67,7 @@ class VMCImportExport:
         self.aws_s3_export_access_secret = ""
         self.aws_s3_export_bucket = ""
         self.cgw_groups_import_error_dict = {}
+        self.cgw_groups_tf_convert_error_dict = {}
         self.cgw_groups_import_exclude_list = []
         self.cgw_import_exclude_list = []
         self.mgw_groups_import_exclude_list = []
@@ -264,9 +266,11 @@ class VMCImportExport:
 
         #CGW groups
         self.cgw_groups_filename     = self.loadConfigFilename(config,"importConfig","cgw_groups_filename")
+        self.cgw_groups_tf_filename  = self.loadConfigFilename(config,"importConfig","cgw_groups_tf_filename")
 
         #MGW groups
         self.mgw_groups_filename     = self.loadConfigFilename(config,"importConfig","mgw_groups_filename")
+        self.mgw_groups_tf_filename  = self.loadConfigFilename(config,"importConfig","mgw_groups_tf_filename")
 
         #AWS
         self.aws_s3_export_access_id = self.loadConfigFilename(awsConfig,"awsConfig","aws_s3_export_access_id")
@@ -2815,6 +2819,285 @@ class VMCImportExport:
                 payload = {}
         return True
 
+    def convert_SDDC_CGW_group_tf(self, provider):
+        """Convert CGW groups from JSON to Terraform"""
+        fname = self.import_path / self.cgw_groups_filename
+        try:
+            with open(fname) as filehandle:
+                groups = json.load(filehandle)
+        except:
+            print('TF conversion failed - unable to open',fname)
+            return False
+
+        payload = {}
+        for group in groups:
+            skip_vm_expression = False
+            skip_group = False
+            for e in self.cgw_groups_import_exclude_list:
+                m = re.match(e,group["display_name"])
+                if m:
+                    print(group["display_name"],'skipped - matches exclusion regex', e)
+                    skip_group = True
+                    break
+            if skip_group is True:
+                continue
+            if group["_create_user"]!= "admin" and group["_create_user"]!="admin;admin":
+                payload["id"]=group["id"]
+                payload["resource_type"]=group["resource_type"]
+                payload["display_name"]=group["display_name"]
+                if 'description' in group:
+                    payload["description"] = group["description"]
+                else:
+                    payload["description"] = ""
+                if 'tags' in group:
+                    payload['tags'] = group['tags']
+
+                if "expression" in group:
+                    group_expression = group["expression"]
+                    for item in group_expression:
+                        if item["resource_type"] == "ExternalIDExpression":
+                            skip_vm_expression = True
+                            msg = f'CGW Group {group["display_name"]} cannot be converted as it relies on VM external ID.'
+                            print(msg)
+                            path = "/infra/domains/cgw/groups/" + group["id"]
+                            self.cgw_groups_tf_convert_error_dict[path] = { "display_name": payload["display_name"] , "error_message": msg }
+                            break
+
+                        if item["resource_type"] == "PathExpression":
+                            skip_vm_expression = True
+                            msg = f'CGW Group {group["display_name"]} cannot be converted as it relies on a specific network path.'
+                            print(msg)
+                            path = "/infra/domains/cgw/groups/" + group["id"]
+                            self.cgw_groups_tf_convert_error_dict[path] = { "display_name": payload["display_name"] , "error_message": msg }
+                            break                        
+
+                if skip_vm_expression == False:
+                    payload["expression"]=group["expression"]
+                    # Example of what we're trying to create
+                    #resource "nsxt_policy_group" "Alpha_Lab_1"  {
+                    #     provider         = nsxt.sddc_alpha
+                    #     domain           = "cgw"
+                    #     display_name     = "Alpha Lab 1"
+                    #     nsx_id           = "Alpha_Lab_1"
+                    #     description      = ""
+
+                    #     criteria {
+                    #             condition {
+                    #                 key             = "Tag"
+                    #                 member_type     = "VirtualMachine"
+                    #                 operator        = "EQUALS"
+                    #                 value           = "|customer"
+                    #             }
+
+                    #     }
+                    #     conjunction {
+                    #         operator = "OR"
+                    #     }
+                    #     criteria {
+                    #             ipaddress_expression {
+                    #                 ip_addresses = ["192.168.80.0/24"]
+                    #             }
+                    #     }
+                    # }
+
+                    # Creates base of the nsxt_policy_group object up to the opening curly brace for criteria
+                    tf_data = f"resource \"nsxt_policy_group\" \"{payload['id']}\" " + " {\n" + \
+                                f"\tprovider         = \"{provider}\"\n" + \
+                                 "\tdomain           = \"cgw\"\n" + \
+                                f"\tdisplay_name     = \"{payload['display_name']}\"\n" + \
+                                f"\tnsx_id           = \"{payload['id']}\"\n" + \
+                                f"\tdescription      = \"{payload['description']}\"\n" + \
+                                 "\n" + \
+                                 "\tcriteria {\n"
+
+                    for expression in payload["expression"]:
+                        #print(expression["resource_type"])
+
+                        if expression["resource_type"] == "IPAddressExpression":
+                            ip_list = expression['ip_addresses']
+                            # The NSX-T provider only accepts network IDs i.e. 192.168.1.0/24, but the data
+                            # coming out of NSX-T will be the gateway IP 192.168.1.1/24. Convert to network IDs
+                            ip_list_converted = []
+                            for ip in ip_list:
+                                ip_list_converted.append(self._calculate_network_address(ip))
+
+                            # The Python list will have IPs in single quotes, but HCL expects double quotes
+                            ip_addresses_converted = str(ip_list_converted).replace("'", "\"")
+
+                            tf_data += "\t\t\tipaddress_expression {" + \
+                                       f"\n\t\t\t\tip_addresses = {ip_addresses_converted}" + \
+                                       "\n\t\t\t}"
+                            
+                        if expression["resource_type"] == "Condition":
+                            tf_data +=  "\t\t\tcondition {" + \
+                                       f"\n\t\t\t\tkey             = \"{expression['key']}\"" + \
+                                       f"\n\t\t\t\tmember_type     = \"{expression['member_type']}\"" + \
+                                       f"\n\t\t\t\toperator        = \"{expression['operator']}\"" + \
+                                       f"\n\t\t\t\tvalue           = \"{expression['value']}\"" + \
+                                        "\n\t\t\t}\n"
+                            
+                        # If we have a conjunction block, we have to close the criteria block above it,
+                        # write out the conjunction block, and then open another criteria block
+                        if expression["resource_type"] == "ConjunctionOperator":
+                            tf_data +=  "\n\t}" +\
+                                        "\n\tconjunction {" + \
+                                        f"\n\t\toperator = \"{expression['conjunction_operator']}\"" + \
+                                         "\n\t}\n" + \
+                                         "\tcriteria {\n"
+                    # Close the criteria block
+                    tf_data += "\n\t}"
+
+                    # Close the nsxt_policy_group block
+                    tf_data += "\n}\n\n"
+                    
+                    fname = self.export_path / self.cgw_groups_tf_filename
+                    with open(fname, 'a') as outfile:
+                        outfile.write(tf_data)
+                    print("CGW Group " + payload["display_name"] + payload["expression"][0]["resource_type"] + " has been converted.")
+                else:
+                    continue
+        return True
+    
+
+    def convert_SDDC_MGW_group_tf(self, provider):
+            """Convert CGW groups from JSON to Terraform"""
+            fname = self.import_path / self.mgw_groups_filename
+            try:
+                with open(fname) as filehandle:
+                    groups = json.load(filehandle)
+            except:
+                print('Import failed - unable to open',fname)
+                return False
+
+            payload = {}
+            for group in groups:
+                skip_vm_expression = False
+                skip_group = False
+                for e in self.mgw_groups_import_exclude_list:
+                    m = re.match(e,group["display_name"])
+                    if m:
+                        print(group["display_name"],'skipped - matches exclusion regex', e)
+                        skip_group = True
+                        break
+                if skip_group is True:
+                    continue
+                if group["_create_user"]!= "admin" and group["_create_user"]!="admin;admin":
+                    payload["id"]=group["id"]
+                    payload["resource_type"]=group["resource_type"]
+                    payload["display_name"]=group["display_name"]
+                    if 'description' in group:
+                        payload["description"] = group["description"]
+                    else:
+                        payload["description"] = ""
+                    if 'tags' in group:
+                        payload['tags'] = group['tags']
+
+                    if "expression" in group:
+                        group_expression = group["expression"]
+                        for item in group_expression:
+                            if item["resource_type"] == "ExternalIDExpression":
+                                skip_vm_expression = True
+                                msg = f'MGW Group {group["display_name"]} cannot be converted as it relies on VM external ID.'
+                                print(msg)
+                                path = "/infra/domains/mgw/groups/" + group["id"]
+                                self.cgw_groups_tf_convert_error_dict[path] = { "display_name": payload["display_name"] , "error_message": msg }
+                                break
+
+                            if item["resource_type"] == "PathExpression":
+                                skip_vm_expression = True
+                                msg = f'MGW Group {group["display_name"]} cannot be converted as it relies on a specific network path.'
+                                print(msg)
+                                path = "/infra/domains/mgw/groups/" + group["id"]
+                                self.cgw_groups_tf_convert_error_dict[path] = { "display_name": payload["display_name"] , "error_message": msg }
+                                break                        
+
+                    if skip_vm_expression == False:
+                        payload["expression"]=group["expression"]
+                        # Example of what we're trying to create
+                        #resource "nsxt_policy_group" "Alpha_Lab_1"  {
+                        #     provider         = nsxt.sddc_alpha
+                        #     domain           = "cgw"
+                        #     display_name     = "Alpha Lab 1"
+                        #     nsx_id           = "Alpha_Lab_1"
+                        #     description      = ""
+
+                        #     criteria {
+                        #             condition {
+                        #                 key             = "Tag"
+                        #                 member_type     = "VirtualMachine"
+                        #                 operator        = "EQUALS"
+                        #                 value           = "|customer"
+                        #             }
+
+                        #     }
+                        #     conjunction {
+                        #         operator = "OR"
+                        #     }
+                        #     criteria {
+                        #             ipaddress_expression {
+                        #                 ip_addresses = ["192.168.80.0/24"]
+                        #             }
+                        #     }
+                        # }
+
+                        # Creates base of the nsxt_policy_group object up to the opening curly brace for criteria
+                        tf_data = f"resource \"nsxt_policy_group\" \"{payload['id']}\" " + " {\n" + \
+                                    f"\tprovider         = \"{provider}\"\n" + \
+                                    "\tdomain           = \"cgw\"\n" + \
+                                    f"\tdisplay_name     = \"{payload['display_name']}\"\n" + \
+                                    f"\tnsx_id           = \"{payload['id']}\"\n" + \
+                                    f"\tdescription      = \"{payload['description']}\"\n" + \
+                                    "\n" + \
+                                    "\tcriteria {\n"
+
+                        for expression in payload["expression"]:
+                            #print(expression["resource_type"])
+
+                            if expression["resource_type"] == "IPAddressExpression":
+                                ip_list = expression['ip_addresses']
+                                # The NSX-T provider only accepts network IDs i.e. 192.168.1.0/24, but the data
+                                # coming out of NSX-T will be the gateway IP 192.168.1.1/24. Convert to network IDs
+                                ip_list_converted = []
+                                for ip in ip_list:
+                                    ip_list_converted.append(self._calculate_network_address(ip))
+
+                                # The Python list will have IPs in single quotes, but HCL expects double quotes
+                                ip_addresses_converted = str(ip_list_converted).replace("'", "\"")
+
+                                tf_data += "\t\t\tipaddress_expression {" + \
+                                        f"\n\t\t\t\tip_addresses = {ip_addresses_converted}" + \
+                                        "\n\t\t\t}"
+                                
+                            if expression["resource_type"] == "Condition":
+                                tf_data +=  "\t\t\tcondition {" + \
+                                        f"\n\t\t\t\tkey             = \"{expression['key']}\"" + \
+                                        f"\n\t\t\t\tmember_type     = \"{expression['member_type']}\"" + \
+                                        f"\n\t\t\t\toperator        = \"{expression['operator']}\"" + \
+                                        f"\n\t\t\t\tvalue           = \"{expression['value']}\"" + \
+                                            "\n\t\t\t}\n"
+                                
+                            # If we have a conjunction block, we have to close the criteria block above it,
+                            # write out the conjunction block, and then open another criteria block
+                            if expression["resource_type"] == "ConjunctionOperator":
+                                tf_data +=  "\n\t}" +\
+                                            "\n\tconjunction {" + \
+                                            f"\n\t\toperator = \"{expression['conjunction_operator']}\"" + \
+                                            "\n\t}\n" + \
+                                            "\tcriteria {\n"
+                        # Close the criteria block
+                        tf_data += "\n\t}"
+
+                        # Close the nsxt_policy_group block
+                        tf_data += "\n}\n\n"
+                        
+                        fname = self.export_path / self.mgw_groups_tf_filename
+                        with open(fname, 'a') as outfile:
+                            outfile.write(tf_data)
+                        print("MGW Group " + payload["display_name"] + payload["expression"][0]["resource_type"] + " has been converted.")
+                    else:
+                        continue
+            return True
+    
     def importServiceAccess(self):
         """Imports SDDC Service Access config from a JSON file"""
 
@@ -2888,6 +3171,13 @@ class VMCImportExport:
             else:
                 print("TEST MODE - Local BGP config  would have been imported.")
 
+
+    def _calculate_network_address(self, cidr):
+        """
+        Calculate the network address from a CIDR.
+        """
+        network = ipaddress.IPv4Network(cidr, False)
+        return network.with_prefixlen
 
     def importVPNBGPNeighbors(self):
         self.vmc_auth.check_access_token_expiration()
@@ -3657,8 +3947,12 @@ class VMCImportExport:
                 return 'natrules.json'
             elif (key == 'cgw_groups_filename'):
                 return 'cgw_groups.json'
+            elif (key == 'cgw_groups_tf_filename'):
+                return 'cgw_groups.tf'
             elif (key == 'mgw_groups_filename'):
                 return 'mgw_groups.json'
+            elif (key == 'mgw_groups_tf_filename'):
+                return 'mgw_groups.tf'            
             elif (key == 'vpn_ike_filename'):
                 return 'vpn-ike.json'
             elif (key == 'vpn_dpd_filename'):

@@ -81,7 +81,7 @@ def main(args):
                                     "python sddc_import_export.py -o import\n\n"
                                     "Import an SDDC from a zipfile:\n"
                                     "python sddc_import_export.py -o import -i json/2020-12-15_10-33-43_json-export.zip\n\n")
-    ap.add_argument("-o","--operation", required=True, choices=['import-nsx','export-nsx','import','export','export-import','check-vmc-ini','export-vcenter','import-vcenter','rolesync','testbed'], help="SDDC-to-SDDC operations: import, export, or export and then immediately import. check-vmc-ini displays the currently configured Org and SDDC for import and export operations. export-nsx to export an on-prem NSX config, then import-nsx to import it to VMC. export-vcenter and import-vcenter to export and import vCenter configs. testbed to create and destroy large numbers of objects to test API limits")
+    ap.add_argument("-o","--operation", required=True, choices=['import-nsx','export-nsx','import','export','export-import','check-vmc-ini','export-vcenter','import-vcenter','rolesync','testbed', 'convert-tf'], help="SDDC-to-SDDC operations: import, export, or export and then immediately import. check-vmc-ini displays the currently configured Org and SDDC for import and export operations. export-nsx to export an on-prem NSX config, then import-nsx to import it to VMC. export-vcenter and import-vcenter to export and import vCenter configs. testbed to create and destroy large numbers of objects to test API limits")
     ap.add_argument("-t", "--test-name", required=False, nargs='+', choices=['create-cgw-groups','delete-cgw-groups','delete-all-cgw-groups'])
     ap.add_argument("-n", "--num-objects", required=False, type=int, default=1000)
     ap.add_argument("-sn", "--start-num", required=False, type=int, default=0)
@@ -999,6 +999,13 @@ def main(args):
             ioObj.importSDDCDFWRule()
 
         print("Import has been concluded. Thank you for using SDDC Import/Export for VMware Cloud on AWS.")
+
+    if intent_name == "convert-tf":
+        no_intent_found = False
+        
+        print("Starting Terraform export")
+        retval = ioObj.convert_SDDC_CGW_group_tf("nsxt.sddc_alpha")
+        retval = ioObj.convert_SDDC_MGW_group_tf("nsxt.sddc_alpha")
 
     if no_intent_found:
         print("\nWelcome to sddc_import_export!")
