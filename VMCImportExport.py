@@ -161,6 +161,7 @@ class VMCImportExport:
         #CGW
         self.cgw_export               = self.loadConfigFlag(config,"exportConfig","cgw_export")
         self.cgw_export_filename      = self.loadConfigFilename(config,"exportConfig","cgw_export_filename")
+        self.cgw_tf_filename            = self.loadConfigFilename(config,"exportConfig","cgw_tf_filename")
         self.cgw_import               = self.loadConfigFlag(config,"importConfig","cgw_import")
         self.cgw_import_filename      = self.loadConfigFilename(config,"importConfig","cgw_import_filename")
         self.cgw_import_exclude_list  = self.loadConfigRegex(config,"importConfig","cgw_import_exclude_list",'|')
@@ -168,6 +169,7 @@ class VMCImportExport:
 
         #MGW
         self.mgw_export          = self.loadConfigFlag(config,"exportConfig","mgw_export")
+        self.mgw_tf_filename     = self.loadConfigFilename(config,"exportConfig","mgw_tf_filename")        
         self.mgw_export_filename = self.loadConfigFilename(config,"exportConfig","mgw_export_filename")
         self.mgw_import          = self.loadConfigFlag(config,"importConfig","mgw_import")
         self.mgw_import_filename = self.loadConfigFilename(config,"importConfig","mgw_import_filename")
@@ -2958,6 +2960,23 @@ class VMCImportExport:
                     continue
         return True
     
+    def _format_string_for_hcl(self, source_string, force_quotes=False):
+        """Convert single quotes to double quotes"""
+        """If force_quotes is True, then add quotes to the beginning and end of the string. Defaults to False"""
+        if source_string[0:7] == "['ANY']":
+            return "[]"
+        tmp_str = source_string.replace("'", "\"")
+        if force_quotes:
+            if tmp_str[0:1] != "\"":
+                tmp_str = "\"" + tmp_str
+            
+            if tmp_str[-1:1] != "\"":
+                tmp_str = tmp_str + "\""
+        return tmp_str
+
+    def _lowercase_bool(self, source_bool):
+        """Force boolean to all lowercase"""
+        return str(source_bool).lower()
 
     def convert_SDDC_MGW_group_tf(self, provider):
             """Convert CGW groups from JSON to Terraform"""
@@ -3096,6 +3115,110 @@ class VMCImportExport:
                         print("MGW Group " + payload["display_name"] + payload["expression"][0]["resource_type"] + " has been converted.")
                     else:
                         continue
+            return True
+    
+    def convert_SDDC_CGW_tf(self, provider, policy_name):
+            """Convert all CGW Rules to TF"""
+            self.vmc_auth.check_access_token_expiration()
+            fname = self.import_path / self.cgw_import_filename
+            try:
+                with open(fname) as filehandle:
+                    cgwrules = json.load(filehandle)
+            except:
+                print('Conversion failed - unable to open',fname)
+                return False
+
+            # Example of what we're trying to create
+            # resource "nsxt_policy_predefined_gateway_policy" "sddc_alpha_cgw_policy" {
+            # provider = nsxt.sddc_alpha
+            # path     = "/infra/domains/mgw/gateway-policies/default"
+
+            # # Default Rules - Do Not Change
+
+            #     rule {
+            #         action                = "ALLOW"
+            #         nsx_id                = "ESXI"
+            #         display_name          = "ESXi Outbound Rule"
+            #         description           = "ESXI"
+            #         sources_excluded      = false
+            #         destinations_excluded = false
+            #         source_groups         = ["/infra/domains/cgw/groups/ESXI"]
+            #         destination_groups    = []
+            #         services              = []
+            #         profiles              = []
+            #         logged                = false
+            #         scope                 = ["/infra/labels/cgw"]
+            #         disabled              = false
+            #         direction             = "IN_OUT"
+            #         ip_version            = "IPV4_IPV6"
+            #     }                    
+            # }
+            tf_data = f"resource \"nsxt_policy_predefined_gateway_policy\" \"{policy_name}\" " + " {\n" + \
+                      f"\tprovider         = {provider}\n" + \
+                       "\tpath             = \"/infra/domains/cgw/gateway-policies/default\"\n"
+            payload = {}
+            for rule in cgwrules:
+                skip_rule = False
+                for e in self.mgw_import_exclude_list:
+                    m = re.match(e,rule["display_name"])
+                    if m:
+                        print(rule["display_name"],'skipped - matches exclusion regex', e)
+                        skip_rule = True
+                        break
+                if skip_rule is True:
+                    continue
+
+                if rule["_create_user"]!= "admin" and rule["_create_user"]!="admin;admin" and rule["_create_user"]!="system":
+                    payload["id"]=rule["id"]
+                    if rule.get("tags"):
+                        payload["tags"] = rule["tags"]
+                    else:
+                        payload["tags"] = ""
+                    if rule.get("description"):
+                        payload["description"] = rule["description"]
+                    else:
+                        payload["description"] = ""
+                    payload["source_groups"] = rule["source_groups"]
+                    payload["resource_type"]=rule["resource_type"]
+                    payload["display_name"]=rule["display_name"]
+                    payload["scope"]=rule["scope"]
+                    payload["action"]=rule["action"]
+                    payload["services"]=rule["services"]
+                    payload["destination_groups"]=rule["destination_groups"]
+                    payload["profiles"]=rule["profiles"]
+                    payload["scope"]=rule["scope"]
+                    payload["disabled"]=rule["disabled"]
+                    payload["logged"]=rule["logged"]
+                    payload["direction"]=rule["direction"]
+                    payload["ip_protocol"]=rule["ip_protocol"]
+
+                    print(rule["source_groups"])
+
+                    tf_data += "\n\trule {" + \
+                              f"\n\t\taction                = \"{self._format_string_for_hcl(str(payload['action']), False)}\"" + \
+                              f"\n\t\tnsx_id                = \"{self._format_string_for_hcl(str(payload['id']), False)}\"" + \
+                              f"\n\t\tdisplay_name          = \"{self._format_string_for_hcl(str(payload['display_name']), False)}\"" + \
+                              f"\n\t\tdescription           = \"{self._format_string_for_hcl(str(payload['description']), False)}\"" + \
+                              f"\n\t\tsources_excluded      = false" + \
+                              f"\n\t\tdestinations_excluded = false" + \
+                              f"\n\t\tsource_groups         = {self._format_string_for_hcl(str(payload['source_groups']), False)}" + \
+                              f"\n\t\tdestination_groups    = {self._format_string_for_hcl(str(payload['destination_groups']), False)}" + \
+                              f"\n\t\tservices              = {self._format_string_for_hcl(str(payload['services']), False)}" + \
+                              f"\n\t\tprofiles              = {self._format_string_for_hcl(str(payload['profiles']), False)}" + \
+                              f"\n\t\tlogged                = {self._lowercase_bool(str(payload['logged']))}" + \
+                              f"\n\t\tscope                 = {self._format_string_for_hcl(str(payload['scope']), False)}" + \
+                              f"\n\t\tdisabled              = {self._lowercase_bool(str(payload['disabled']))}" + \
+                              f"\n\t\tdirection             = {self._format_string_for_hcl(str(payload['direction']), True)}" + \
+                              f"\n\t\tip_version            = {self._format_string_for_hcl(str(payload['ip_protocol']), True)}" + \
+                              "\n\t}\n\n"
+                    print("CGW Rule " + payload["display_name"] + " has been converted.")  
+                    payload = {}
+
+            tf_data += "}"
+            fname = self.export_path / self.cgw_tf_filename
+            with open(fname, 'w') as outfile:
+                outfile.write(tf_data)
+                          
             return True
     
     def importServiceAccess(self):
@@ -3925,10 +4048,14 @@ class VMCImportExport:
         except:
             if (key == 'cgw_export_filename'):
                 return 'cgw.json'
+            elif (key == 'cgw_tf_filename'):
+                return 'cgw.tf'            
             elif (key == 'cgw_import_filename'):
                 return 'cgw.json'
             elif (key == 'mgw_export_filename'):
                 return 'mgw.json'
+            elif (key == 'mgw_tf_filename'):
+                return 'mgw.tf'            
             elif (key == 'mgw_import_filename'):
                 return 'mgw.json'
             elif (key == 'network_export_filename'):

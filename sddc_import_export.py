@@ -1004,8 +1004,10 @@ def main(args):
         no_intent_found = False
         
         print("Starting Terraform export")
-        retval = ioObj.convert_SDDC_CGW_group_tf("nsxt.sddc_alpha")
-        retval = ioObj.convert_SDDC_MGW_group_tf("nsxt.sddc_alpha")
+        #retval = ioObj.convert_SDDC_CGW_group_tf("nsxt.sddc_alpha")
+        retval = ioObj.convert_SDDC_CGW_tf("nsxt.sddc_alpha", "sddc_alpha_cgw_policy")
+        #retval = ioObj.convert_SDDC_MGW_group_tf("nsxt.sddc_alpha")
+
 
     if no_intent_found:
         print("\nWelcome to sddc_import_export!")
